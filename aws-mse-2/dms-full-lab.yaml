@@ -1,0 +1,611 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  End-to-end AWS DMS MySQL full-load lab in ap-south-1.
+  Creates VPC networking, private SSM-managed EC2 client, source and target
+  RDS MySQL instances, and AWS DMS replication resources. SQL bootstrap,
+  endpoint testing, task start, and result verification are documented separately.
+
+Parameters:
+  AvailabilityZoneA:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: ap-south-1a
+  AvailabilityZoneB:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: ap-south-1b
+
+  CreateNatGateway:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+    Description: NAT Gateway has hourly and data-processing charges. Keep true for private EC2 package downloads.
+
+  CreateSsmEndpoints:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+    Description: SSM interface endpoints have hourly and data-processing charges. Keep true for private Session Manager access without NAT-based SSM access.
+
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 x86_64 AMI from the public SSM parameter.
+
+  Ec2InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3.medium]
+  DmsInstanceClass:
+    Type: String
+    Default: dms.t3.small
+    AllowedValues: [dms.t3.small, dms.t3.medium, dms.t3.large]
+    Description: Smallest supported class in ap-south-1 is dms.t3.small.
+  RdsInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [db.t3.micro, db.t3.small, db.t3.medium]
+
+  SourceDmsUsername:
+    Type: String
+    Default: dms_user
+    MinLength: 1
+    MaxLength: 16
+    Description: Create this MySQL user on the source database after stack deployment.
+  SourceDmsPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 41
+    Description: Password to use when manually creating dms_user on the source database. Use a password that is safe to type into a SQL statement.
+
+Conditions:
+  MakeNatGateway: !Equals [!Ref CreateNatGateway, 'true']
+  MakeSsmEndpoints: !Equals [!Ref CreateSsmEndpoints, 'true']
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # NETWORK
+  # ---------------------------------------------------------------------------
+  TrainingVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: training-vpc
+
+  TrainingPublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref TrainingVpc
+      CidrBlock: 10.0.10.0/24
+      AvailabilityZone: !Ref AvailabilityZoneA
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: training-public-subnet
+
+  TrainingPrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref TrainingVpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Ref AvailabilityZoneA
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: training-private-a
+
+  TrainingPrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref TrainingVpc
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Ref AvailabilityZoneB
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: training-private-b
+
+  TrainingInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: training-igw
+
+  AttachInternetGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref TrainingVpc
+      InternetGatewayId: !Ref TrainingInternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref TrainingVpc
+      Tags:
+        - Key: Name
+          Value: training-public-rt
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachInternetGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref TrainingInternetGateway
+
+  PublicSubnetRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref TrainingPublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    Condition: MakeNatGateway
+    DependsOn: AttachInternetGateway
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: training-nat-eip
+
+  TrainingNatGateway:
+    Type: AWS::EC2::NatGateway
+    Condition: MakeNatGateway
+    DependsOn: PublicSubnetRouteAssociation
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref TrainingPublicSubnet
+      ConnectivityType: public
+      Tags:
+        - Key: Name
+          Value: training-nat-gateway
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref TrainingVpc
+      Tags:
+        - Key: Name
+          Value: training-private-rt
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: MakeNatGateway
+    DependsOn: TrainingNatGateway
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref TrainingNatGateway
+
+  PrivateSubnetARouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref TrainingPrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref TrainingPrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ---------------------------------------------------------------------------
+  # SECURITY GROUPS
+  # ---------------------------------------------------------------------------
+  TrainingClientSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Private MySQL client EC2; Session Manager only; no inbound SSH.
+      VpcId: !Ref TrainingVpc
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: training-client-sg
+
+  TrainingDmsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: AWS DMS replication instance network access.
+      VpcId: !Ref TrainingVpc
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: training-dms-sg
+
+  TrainingSourceDbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Source MySQL accepts port 3306 only from client EC2 and DMS.
+      VpcId: !Ref TrainingVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref TrainingClientSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref TrainingDmsSecurityGroup
+      Tags:
+        - Key: Name
+          Value: training-source-db-sg
+
+  TrainingTargetDbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Target MySQL accepts port 3306 only from client EC2 and DMS.
+      VpcId: !Ref TrainingVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref TrainingClientSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref TrainingDmsSecurityGroup
+      Tags:
+        - Key: Name
+          Value: training-target-db-sg
+
+  TrainingSsmEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTPS 443 from the private EC2 client to SSM interface endpoints.
+      VpcId: !Ref TrainingVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref TrainingClientSecurityGroup
+      Tags:
+        - Key: Name
+          Value: training-ssm-endpoint-sg
+
+  # ---------------------------------------------------------------------------
+  # PRIVATE SSM ENDPOINTS
+  # ---------------------------------------------------------------------------
+  SsmInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: MakeSsmEndpoints
+    Properties:
+      VpcId: !Ref TrainingVpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssm
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref TrainingPrivateSubnetA
+      SecurityGroupIds:
+        - !Ref TrainingSsmEndpointSecurityGroup
+      Tags:
+        - Key: Name
+          Value: training-vpce-ssm
+
+  SsmMessagesInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: MakeSsmEndpoints
+    Properties:
+      VpcId: !Ref TrainingVpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssmmessages
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref TrainingPrivateSubnetA
+      SecurityGroupIds:
+        - !Ref TrainingSsmEndpointSecurityGroup
+      Tags:
+        - Key: Name
+          Value: training-vpce-ssmmessages
+
+  # ---------------------------------------------------------------------------
+  # EC2 CLIENT AND IAM
+  # ---------------------------------------------------------------------------
+  TrainingEC2SSMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: TrainingEC2SSMRole
+
+  TrainingEC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref TrainingEC2SSMRole
+
+  MysqlClient:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - PrivateSubnetARouteAssociation
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref Ec2InstanceType
+      IamInstanceProfile: !Ref TrainingEC2InstanceProfile
+      SubnetId: !Ref TrainingPrivateSubnetA
+      SecurityGroupIds:
+        - !Ref TrainingClientSecurityGroup
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 8
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: mysql-client
+
+  # ---------------------------------------------------------------------------
+  # RDS SUBNET GROUPS, DATABASES AND PARAMETER GROUP
+  # ---------------------------------------------------------------------------
+  RetailDbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for source and target MySQL databases.
+      SubnetIds:
+        - !Ref TrainingPrivateSubnetA
+        - !Ref TrainingPrivateSubnetB
+      Tags:
+        - Key: Name
+          Value: retail-db-subnet-group
+
+  RetailTargetMysqlParameters:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: Target MySQL parameters for the DMS full-load lab.
+      Family: mysql8.0
+      Parameters:
+        local_infile: '1'
+      Tags:
+        - Key: Name
+          Value: retail-mysql-target-params
+
+  RetailSourceMysql:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: retail-source-mysql
+      Engine: mysql
+      EngineVersion: '8.0.46'
+      DBInstanceClass: !Ref RdsInstanceClass
+      AllocatedStorage: 20
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: retaildb
+      MasterUsername: admin
+      ManageMasterUserPassword: true
+      DBSubnetGroupName: !Ref RetailDbSubnetGroup
+      VPCSecurityGroups:
+        - !Ref TrainingSourceDbSecurityGroup
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 0
+      AutoMinorVersionUpgrade: true
+      DeletionProtection: false
+      Tags:
+        - Key: Name
+          Value: retail-source-mysql
+
+  RetailTargetMysql:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: retail-target-mysql
+      Engine: mysql
+      EngineVersion: '8.0.46'
+      DBInstanceClass: !Ref RdsInstanceClass
+      AllocatedStorage: 20
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: retaildb
+      MasterUsername: admin
+      ManageMasterUserPassword: true
+      DBSubnetGroupName: !Ref RetailDbSubnetGroup
+      DBParameterGroupName: !Ref RetailTargetMysqlParameters
+      VPCSecurityGroups:
+        - !Ref TrainingTargetDbSecurityGroup
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 0
+      AutoMinorVersionUpgrade: true
+      DeletionProtection: false
+      Tags:
+        - Key: Name
+          Value: retail-target-mysql
+
+  # ---------------------------------------------------------------------------
+  # DMS SUBNET GROUP, REPLICATION INSTANCE, ENDPOINTS AND TASK
+  # ---------------------------------------------------------------------------
+  DmsVpcRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: dms-vpc-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - dms.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonDMSVPCManagementRole
+      Tags:
+        - Key: Name
+          Value: dms-vpc-role
+
+  RetailDmsSubnetGroup:
+    Type: AWS::DMS::ReplicationSubnetGroup
+    DependsOn: DmsVpcRole
+    Properties:
+      ReplicationSubnetGroupDescription: Private subnets for the DMS replication instance.
+      ReplicationSubnetGroupIdentifier: retail-dms-subnet-group
+      SubnetIds:
+        - !Ref TrainingPrivateSubnetA
+        - !Ref TrainingPrivateSubnetB
+      Tags:
+        - Key: Name
+          Value: retail-dms-subnet-group
+
+  RetailDmsReplication:
+    Type: AWS::DMS::ReplicationInstance
+    DependsOn:
+      - PrivateSubnetARouteAssociation
+      - PrivateSubnetBRouteAssociation
+    Properties:
+      ReplicationInstanceIdentifier: retail-dms-replication
+      ReplicationInstanceClass: !Ref DmsInstanceClass
+      AllocatedStorage: 50
+      VpcSecurityGroupIds:
+        - !Ref TrainingDmsSecurityGroup
+      ReplicationSubnetGroupIdentifier: !Ref RetailDmsSubnetGroup
+      PubliclyAccessible: false
+      MultiAZ: false
+      AutoMinorVersionUpgrade: true
+      Tags:
+        - Key: Name
+          Value: retail-dms-replication
+
+  RetailSourceEndpoint:
+    Type: AWS::DMS::Endpoint
+    DependsOn:
+      - RetailSourceMysql
+    Properties:
+      EndpointIdentifier: retail-source-endpoint
+      EndpointType: source
+      EngineName: mysql
+      ServerName: !GetAtt RetailSourceMysql.Endpoint.Address
+      Port: 3306
+      Username: !Ref SourceDmsUsername
+      Password: !Ref SourceDmsPassword
+      SslMode: none
+      Tags:
+        - Key: Name
+          Value: retail-source-endpoint
+
+  RetailTargetEndpoint:
+    Type: AWS::DMS::Endpoint
+    DependsOn:
+      - RetailTargetMysql
+    Properties:
+      EndpointIdentifier: retail-target-endpoint
+      EndpointType: target
+      EngineName: mysql
+      ServerName: !GetAtt RetailTargetMysql.Endpoint.Address
+      Port: 3306
+      Username: admin
+      Password: !Sub
+        - '{{resolve:secretsmanager:${SecretArn}:SecretString:password}}'
+        - SecretArn: !GetAtt RetailTargetMysql.MasterUserSecret.SecretArn
+      SslMode: none
+      Tags:
+        - Key: Name
+          Value: retail-target-endpoint
+
+  RetailFullLoadTask:
+    Type: AWS::DMS::ReplicationTask
+    DependsOn:
+      - RetailDmsReplication
+      - RetailSourceEndpoint
+      - RetailTargetEndpoint
+    Properties:
+      ReplicationTaskIdentifier: retail-full-load-task
+      MigrationType: full-load
+      ReplicationInstanceArn: !Ref RetailDmsReplication
+      SourceEndpointArn: !Ref RetailSourceEndpoint
+      TargetEndpointArn: !Ref RetailTargetEndpoint
+      TableMappings: |
+        {
+          "rules": [
+            {
+              "rule-type": "selection",
+              "rule-id": "1",
+              "rule-name": "include-retaildb-all-tables",
+              "object-locator": {
+                "schema-name": "retaildb",
+                "table-name": "%"
+              },
+              "rule-action": "include"
+            }
+          ]
+        }
+      ReplicationTaskSettings: |
+        {
+          "TargetMetadata": {
+            "TargetTablePrepMode": "DO_NOTHING"
+          }
+        }
+      Tags:
+        - Key: Name
+          Value: retail-full-load-task
+
+Outputs:
+  VpcId:
+    Description: VPC containing the complete lab.
+    Value: !Ref TrainingVpc
+  PublicSubnetId:
+    Value: !Ref TrainingPublicSubnet
+  PrivateSubnetAId:
+    Value: !Ref TrainingPrivateSubnetA
+  PrivateSubnetBId:
+    Value: !Ref TrainingPrivateSubnetB
+  ClientInstanceId:
+    Description: Connect to this instance using Systems Manager Session Manager.
+    Value: !Ref MysqlClient
+  ClientSecurityGroupId:
+    Value: !Ref TrainingClientSecurityGroup
+  DmsSecurityGroupId:
+    Value: !Ref TrainingDmsSecurityGroup
+  SourceDbSecurityGroupId:
+    Value: !Ref TrainingSourceDbSecurityGroup
+  TargetDbSecurityGroupId:
+    Value: !Ref TrainingTargetDbSecurityGroup
+  SourceDbEndpoint:
+    Value: !GetAtt RetailSourceMysql.Endpoint.Address
+  TargetDbEndpoint:
+    Value: !GetAtt RetailTargetMysql.Endpoint.Address
+  SourceMasterSecretArn:
+    Description: Retrieve the source admin password from this Secrets Manager secret.
+    Value: !GetAtt RetailSourceMysql.MasterUserSecret.SecretArn
+  TargetMasterSecretArn:
+    Description: DMS target endpoint uses the target RDS-managed master secret.
+    Value: !GetAtt RetailTargetMysql.MasterUserSecret.SecretArn
+  DmsReplicationInstanceArn:
+    Value: !Ref RetailDmsReplication
+  SourceDmsEndpointArn:
+    Value: !Ref RetailSourceEndpoint
+  TargetDmsEndpointArn:
+    Value: !Ref RetailTargetEndpoint
+  DmsTaskArn:
+    Value: !Ref RetailFullLoadTask
+  NatGatewayId:
+    Condition: MakeNatGateway
+    Value: !Ref TrainingNatGateway
+  SsmEndpointsCreated:
+    Value: !If [MakeSsmEndpoints, 'true', 'false']

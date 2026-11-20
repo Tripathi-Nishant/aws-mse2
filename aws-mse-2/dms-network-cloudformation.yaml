@@ -1,0 +1,211 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS DMS Full Load lab network in ap-south-1. Creates network only; no EC2, RDS, or DMS resources.'
+Parameters:
+  CreateNatGateway:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+    Description: NAT has hourly and data-processing charges. Keep true if private EC2 needs outbound internet.
+  CreateSsmEndpoints:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+    Description: Interface endpoints incur hourly and data charges.
+Conditions:
+  MakeNatGateway: !Equals [!Ref CreateNatGateway, 'true']
+  MakeSsmEndpoints: !Equals [!Ref CreateSsmEndpoints, 'true']
+Resources:
+  TrainingVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: training-vpc}]
+  TrainingPublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref TrainingVpc
+      CidrBlock: 10.0.10.0/24
+      AvailabilityZone: ap-south-1a
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: training-public-subnet}]
+  TrainingPrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref TrainingVpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: ap-south-1a
+      MapPublicIpOnLaunch: false
+      Tags: [{Key: Name, Value: training-private-a}]
+  TrainingPrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref TrainingVpc
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: ap-south-1b
+      MapPublicIpOnLaunch: false
+      Tags: [{Key: Name, Value: training-private-b}]
+  TrainingInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{Key: Name, Value: training-igw}]
+  AttachInternetGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref TrainingVpc
+      InternetGatewayId: !Ref TrainingInternetGateway
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref TrainingVpc
+      Tags: [{Key: Name, Value: training-public-rt}]
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachInternetGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref TrainingInternetGateway
+  PublicSubnetRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref TrainingPublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+  NatEip:
+    Type: AWS::EC2::EIP
+    Condition: MakeNatGateway
+    DependsOn: AttachInternetGateway
+    Properties:
+      Domain: vpc
+      Tags: [{Key: Name, Value: training-nat-eip}]
+  TrainingNatGateway:
+    Type: AWS::EC2::NatGateway
+    Condition: MakeNatGateway
+    DependsOn: PublicSubnetRouteAssociation
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref TrainingPublicSubnet
+      ConnectivityType: public
+      Tags: [{Key: Name, Value: training-nat-gateway}]
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref TrainingVpc
+      Tags: [{Key: Name, Value: training-private-rt}]
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: MakeNatGateway
+    DependsOn: TrainingNatGateway
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref TrainingNatGateway
+  PrivateSubnetARouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref TrainingPrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+  PrivateSubnetBRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref TrainingPrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+  TrainingClientSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Private mysql-client EC2; Session Manager only; no inbound SSH
+      GroupName: training-client-sg
+      VpcId: !Ref TrainingVpc
+      SecurityGroupEgress:
+        - {IpProtocol: '-1', CidrIp: 0.0.0.0/0}
+      Tags: [{Key: Name, Value: training-client-sg}]
+  TrainingDmsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: DMS replication instance
+      GroupName: training-dms-sg
+      VpcId: !Ref TrainingVpc
+      SecurityGroupEgress:
+        - {IpProtocol: '-1', CidrIp: 0.0.0.0/0}
+      Tags: [{Key: Name, Value: training-dms-sg}]
+  TrainingSourceDbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Source RDS MySQL from client and DMS only
+      GroupName: training-source-db-sg
+      VpcId: !Ref TrainingVpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 3306, ToPort: 3306, SourceSecurityGroupId: !Ref TrainingClientSecurityGroup}
+        - {IpProtocol: tcp, FromPort: 3306, ToPort: 3306, SourceSecurityGroupId: !Ref TrainingDmsSecurityGroup}
+      SecurityGroupEgress:
+        - {IpProtocol: '-1', CidrIp: 0.0.0.0/0}
+      Tags: [{Key: Name, Value: training-source-db-sg}]
+  TrainingTargetDbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Target RDS MySQL from client and DMS only
+      GroupName: training-target-db-sg
+      VpcId: !Ref TrainingVpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 3306, ToPort: 3306, SourceSecurityGroupId: !Ref TrainingClientSecurityGroup}
+        - {IpProtocol: tcp, FromPort: 3306, ToPort: 3306, SourceSecurityGroupId: !Ref TrainingDmsSecurityGroup}
+      SecurityGroupEgress:
+        - {IpProtocol: '-1', CidrIp: 0.0.0.0/0}
+      Tags: [{Key: Name, Value: training-target-db-sg}]
+  TrainingSsmEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTPS from training-client-sg to private SSM endpoints
+      GroupName: training-ssm-endpoint-sg
+      VpcId: !Ref TrainingVpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, SourceSecurityGroupId: !Ref TrainingClientSecurityGroup}
+      SecurityGroupEgress:
+        - {IpProtocol: '-1', CidrIp: 0.0.0.0/0}
+      Tags: [{Key: Name, Value: training-ssm-endpoint-sg}]
+  SsmInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: MakeSsmEndpoints
+    Properties:
+      VpcId: !Ref TrainingVpc
+      VpcEndpointType: Interface
+      ServiceName: com.amazonaws.ap-south-1.ssm
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref TrainingPrivateSubnetA]
+      SecurityGroupIds: [!Ref TrainingSsmEndpointSecurityGroup]
+      Tags: [{Key: Name, Value: training-vpce-ssm}]
+  SsmMessagesInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: MakeSsmEndpoints
+    Properties:
+      VpcId: !Ref TrainingVpc
+      VpcEndpointType: Interface
+      ServiceName: com.amazonaws.ap-south-1.ssmmessages
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref TrainingPrivateSubnetA]
+      SecurityGroupIds: [!Ref TrainingSsmEndpointSecurityGroup]
+      Tags: [{Key: Name, Value: training-vpce-ssmmessages}]
+Outputs:
+  VpcId:
+    Description: Use for RDS DB subnet group and DMS replication subnet group
+    Value: !Ref TrainingVpc
+  PublicSubnetId:
+    Value: !Ref TrainingPublicSubnet
+  PrivateSubnetAId:
+    Value: !Ref TrainingPrivateSubnetA
+  PrivateSubnetBId:
+    Value: !Ref TrainingPrivateSubnetB
+  ClientSecurityGroupId:
+    Value: !Ref TrainingClientSecurityGroup
+  DmsSecurityGroupId:
+    Value: !Ref TrainingDmsSecurityGroup
+  SourceDbSecurityGroupId:
+    Value: !Ref TrainingSourceDbSecurityGroup
+  TargetDbSecurityGroupId:
+    Value: !Ref TrainingTargetDbSecurityGroup
+  SsmEndpointSecurityGroupId:
+    Value: !Ref TrainingSsmEndpointSecurityGroup
+  NatGatewayId:
+    Condition: MakeNatGateway
+    Value: !Ref TrainingNatGateway
